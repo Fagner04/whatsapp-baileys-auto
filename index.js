@@ -60,7 +60,7 @@ app.post('/api/device/create', async (req, res) => {
     const sock = makeWASocket({
       version,
       logger,
-      printQRInTerminal: true,
+      // printQRInTerminal removed - handling QR via connection.update
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -123,10 +123,19 @@ app.post('/api/device/create', async (req, res) => {
         logger.info(`Connection closed for ${deviceId}, reconnecting: ${shouldReconnect}`);
 
         if (shouldReconnect) {
-          setTimeout(() => {
-            connections.delete(deviceId);
-            // Recreate connection
-          }, 3000);
+          setTimeout(async () => {
+            try {
+              // trigger self-healing reconnection using the same auth state
+              await fetch(`http://127.0.0.1:${PORT}/api/device/create`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ deviceId, supabaseUrl, supabaseKey })
+              });
+              logger.info(`Recreate connection triggered for ${deviceId}`);
+            } catch (e) {
+              logger.error('Failed to recreate connection', e);
+            }
+          }, 2000);
         } else {
           connections.delete(deviceId);
         }
