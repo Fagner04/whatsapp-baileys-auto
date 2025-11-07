@@ -2,14 +2,31 @@ import express from 'express';
 import cors from 'cors';
 import qrcode from 'qrcode';
 import pino from 'pino';
-import makeWASocket, {
+import baileys from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import 'dotenv/config';
+
+const {
+  // do NOT pull default here to avoid shape issues across module systems
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-} from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import 'dotenv/config';
+} = baileys;
+
+// Robust resolver for makeWASocket across CJS/ESM builds
+const resolveMakeWASocket = (mod) => {
+  try {
+    if (typeof mod?.default === 'function') return mod.default;
+    if (typeof mod?.makeWASocket === 'function') return mod.makeWASocket;
+    if (typeof mod === 'function') return mod;
+    if (typeof mod?.default?.makeWASocket === 'function') return mod.default.makeWASocket;
+  } catch (_) {}
+  return null;
+};
+
+const makeWASocketResolved = resolveMakeWASocket(baileys);
+
 
 const app = express();
 const logger = pino({ level: 'info' });
@@ -48,7 +65,15 @@ app.post('/api/device/create', async (req, res) => {
 
     const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
+    if (typeof makeWASocketResolved !== 'function') {
+      logger.error('Unable to resolve makeWASocket from @whiskeysockets/baileys', {
+        keys: Object.keys(baileys || {}),
+        type: typeof makeWASocketResolved,
+      });
+      return res.status(500).json({ error: 'makeWASocket is not a function' });
+    }
+
+    const sock = makeWASocketResolved({
       version,
       logger,
       printQRInTerminal: true,
