@@ -75,6 +75,12 @@ app.post('/api/device/create', async (req, res) => {
     // QR Code handler
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      
+      logger.info(`Connection update for ${deviceId}:`, { 
+        connection, 
+        hasQR: !!qr,
+        reason: lastDisconnect?.error?.message 
+      });
 
       if (qr) {
         try {
@@ -84,7 +90,7 @@ app.post('/api/device/create', async (req, res) => {
 
           // Update device in Supabase with QR code
           if (supabaseUrl && supabaseKey) {
-            await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+            const response = await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
               method: 'PATCH',
               headers: {
                 'apikey': supabaseKey,
@@ -97,6 +103,12 @@ app.post('/api/device/create', async (req, res) => {
                 status: 'connecting'
               })
             });
+            
+            if (!response.ok) {
+              logger.error(`Failed to update QR in Supabase: ${response.status} ${response.statusText}`);
+            } else {
+              logger.info(`QR code saved to Supabase for device: ${deviceId}`);
+            }
           }
         } catch (err) {
           logger.error('Error generating QR code:', err);
@@ -136,30 +148,46 @@ app.post('/api/device/create', async (req, res) => {
           });
         }
       } else if (connection === 'open') {
-        logger.info(`Connection opened for device: ${deviceId}`);
+        logger.info(`🟢 Connection opened for device: ${deviceId}`);
         qrCodes.delete(deviceId);
 
         // Get phone number
         const phoneNumber = sock.user?.id?.split(':')[0] || '';
+        logger.info(`Phone number extracted: +${phoneNumber}`);
 
         // Update device in Supabase
         if (supabaseUrl && supabaseKey) {
-          await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
-            method: 'PATCH',
-            headers: {
-              'apikey': supabaseKey,
-              'Authorization': `Bearer ${supabaseKey}`,
-              'Content-Type': 'application/json',
-              'Prefer': 'return=minimal'
-            },
-            body: JSON.stringify({
-              status: 'connected',
-              phone: `+${phoneNumber}`,
-              qr_code: null,
-              last_seen: new Date().toISOString()
-            })
-          });
+          try {
+            const response = await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+              method: 'PATCH',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify({
+                status: 'connected',
+                phone: `+${phoneNumber}`,
+                qr_code: null,
+                last_seen: new Date().toISOString()
+              })
+            });
+            
+            if (!response.ok) {
+              const errorText = await response.text();
+              logger.error(`Failed to update device as connected in Supabase: ${response.status} ${response.statusText}`, errorText);
+            } else {
+              logger.info(`✅ Device ${deviceId} marked as CONNECTED in Supabase`);
+            }
+          } catch (err) {
+            logger.error('Error updating connected status in Supabase:', err);
+          }
+        } else {
+          logger.error('Missing Supabase credentials - cannot update device status');
         }
+      } else if (connection === 'connecting') {
+        logger.info(`🔄 Device ${deviceId} is connecting...`);
       }
     });
 
