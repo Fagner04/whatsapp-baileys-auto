@@ -17,9 +17,10 @@ const app = express();
 const logger = pino({ level: 'info' });
 const PORT = process.env.PORT || 3000;
 
-// Store active connections
+// Store active connections with metadata
 const connections = new Map();
 const qrCodes = new Map();
+const deviceMetadata = new Map(); // Store battery, last_seen, etc.
 
 app.use(cors());
 app.use(express.json());
@@ -203,6 +204,63 @@ app.post('/api/device/create', async (req, res) => {
     // Save credentials when updated
     sock.ev.on('creds.update', saveCreds);
 
+    // Handle battery updates
+    sock.ev.on('call', async (calls) => {
+      // Track battery updates through call events
+      for (const call of calls) {
+        if (call.battery) {
+          const batteryLevel = call.battery;
+          deviceMetadata.set(deviceId, {
+            ...deviceMetadata.get(deviceId),
+            battery: batteryLevel
+          });
+          
+          // Update in Supabase
+          if (supabaseUrl && supabaseKey) {
+            await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+              method: 'PATCH',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify({
+                battery: batteryLevel,
+                last_seen: new Date().toISOString()
+              })
+            });
+          }
+        }
+      }
+    });
+
+    // Periodic sync for device status
+    const syncInterval = setInterval(async () => {
+      if (connections.has(deviceId)) {
+        const conn = connections.get(deviceId);
+        if (conn?.sock?.user) {
+          // Update last_seen periodically
+          if (supabaseUrl && supabaseKey) {
+            await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+              method: 'PATCH',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify({
+                last_seen: new Date().toISOString()
+              })
+            });
+          }
+        }
+      } else {
+        clearInterval(syncInterval);
+      }
+    }, 30000); // Update every 30 seconds
+
     // Handle incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type === 'notify') {
@@ -235,6 +293,20 @@ app.post('/api/device/create', async (req, res) => {
                 content: messageContent,
                 status: 'received',
                 timestamp: new Date(msg.messageTimestamp * 1000).toISOString()
+              })
+            });
+            
+            // Update last_seen on message receive
+            await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+              method: 'PATCH',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify({
+                last_seen: new Date().toISOString()
               })
             });
           }
@@ -293,6 +365,23 @@ app.post('/api/message/send', async (req, res) => {
 
     logger.info(`Message sent from ${deviceId} to ${to}`);
 
+    // Update last_seen after sending message
+    const { supabaseUrl, supabaseKey } = connection;
+    if (supabaseUrl && supabaseKey) {
+      await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+        method: 'PATCH',
+        headers: {
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          last_seen: new Date().toISOString()
+        })
+      });
+    }
+
     res.json({
       success: true,
       message: 'Message sent'
@@ -338,15 +427,65 @@ app.post('/api/device/:deviceId/disconnect', async (req, res) => {
   }
 });
 
-// Get connection status
+// Get connection status and device info
 app.get('/api/device/:deviceId/status', (req, res) => {
   const { deviceId } = req.params;
   const connection = connections.get(deviceId);
+  const metadata = deviceMetadata.get(deviceId) || {};
 
   res.json({
     connected: !!connection,
-    hasQR: qrCodes.has(deviceId)
+    hasQR: qrCodes.has(deviceId),
+    battery: metadata.battery || 100,
+    phone: connection?.sock?.user?.id?.split(':')[0] || null
   });
+});
+
+// Sync device info endpoint (called by edge function)
+app.post('/api/device/:deviceId/sync', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const connection = connections.get(deviceId);
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Device not connected' });
+    }
+
+    const { sock, supabaseUrl, supabaseKey } = connection;
+    const metadata = deviceMetadata.get(deviceId) || {};
+
+    if (sock?.user && supabaseUrl && supabaseKey) {
+      const phoneNumber = sock.user.id?.split(':')[0] || '';
+      
+      await fetch(`${supabaseUrl}/rest/v1/devices?id=eq.${deviceId}`, {
+        method: 'PATCH',
+        headers: {
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          status: 'connected',
+          phone: phoneNumber ? `+${phoneNumber}` : null,
+          battery: metadata.battery || 100,
+          last_seen: new Date().toISOString()
+        })
+      });
+
+      res.json({
+        success: true,
+        phone: phoneNumber ? `+${phoneNumber}` : null,
+        battery: metadata.battery || 100,
+        status: 'connected'
+      });
+    } else {
+      res.status(400).json({ error: 'Device not fully initialized' });
+    }
+  } catch (error) {
+    logger.error('Error syncing device:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.listen(PORT, () => {
